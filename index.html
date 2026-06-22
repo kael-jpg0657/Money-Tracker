@@ -53,6 +53,12 @@ const INC_CATS=["Salary","Investments","Part-Time","Bonus","Last Month Money","R
 const CAT_ICONS={Food:"🍜",Coffee:"☕","Personal Care":"🧴",Debt:"💳",Motorcycle:"🏍️",Pets:"🐾",Gift:"🎁",Load:"📱",Home:"🏠",Beauty:"💄",Health:"💊",Electronics:"📱",Entertainment:"🎮",Rent:"🏘️",Transportation:"🚗",WIFI:"📶",Clothing:"👕",Fee:"📋",Salary:"💼",Investments:"📈","Part-Time":"🤝",Bonus:"🎉","Last Month Money":"💵","Rice Encashment":"🍚",Loan:"🏦","Owed Money":"🤝",Others:"📦"};
 
 const LS_KEY="kael_moneytracker_v2";
+
+// ── AI Proxy Config ──
+// Replace this URL with your Cloudflare Worker URL after deploying worker.js
+// Format: https://your-worker-name.your-subdomain.workers.dev
+const AI_PROXY_URL = "YOUR_CLOUDFLARE_WORKER_URL_HERE";
+const AI_READY = AI_PROXY_URL !== "YOUR_CLOUDFLARE_WORKER_URL_HERE";
 function loadSaved(){try{const r=localStorage.getItem(LS_KEY);if(r)return JSON.parse(r);}catch{}return null;}
 function saveSaved(txns,dark,yr,mo){try{localStorage.setItem(LS_KEY,JSON.stringify({txns,dark,yr,mo}));}catch{}}
 
@@ -420,7 +426,8 @@ function App(){
       const prompt=`You are a friendly Filipino personal finance coach. Analyze this monthly spending for ${mLbl}:\n\nTotal Expenses: ₱${expenses.toLocaleString()}\n${income>0?`Total Income: ₱${income.toLocaleString()}\nSavings Rate: ${income>0?(((income-expenses)/income)*100).toFixed(1):0}%`:"No income logged"}\n\nCategory Breakdown:\n${breakdown}\n\nGive a SHORT, warm, actionable insight (3-4 sentences max). Mention the top spending category by name, give one specific tip to reduce it, and one encouraging note. Use Filipino context (mention peso ₱, use "suki", "tipid", etc occasionally). Be conversational, not formal. No bullet points, just natural text.`;
 
       try{
-        const res=await fetch("https://api.anthropic.com/v1/messages",{
+        if(!AI_READY){setInsight("⚠️ AI not configured yet. Deploy the Cloudflare Worker proxy and update AI_PROXY_URL in the app.");setLoading(false);return;}
+        const res=await fetch(AI_PROXY_URL,{
           method:"POST",
           headers:{"Content-Type":"application/json"},
           body:JSON.stringify({model:"claude-sonnet-4-6",max_tokens:1000,messages:[{role:"user",content:prompt}]})
@@ -921,7 +928,8 @@ Top expense categories: ${categoryBreakdown.slice(0,3).map(c=>`${c.name} (${c.pc
 
 Write a SHORT personalized budget + savings plan (5-7 sentences). Cover: which budget categories are over/under, one concrete tip per problem area, how much they should set aside monthly for their goals, and one motivational closing. Use Filipino tone (₱, casual, warm). No bullet points, just flowing paragraphs.`;
       try{
-        const res=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-6",max_tokens:1000,messages:[{role:"user",content:prompt}]})});
+        if(!AI_READY){setAiPlan("⚠️ AI not configured yet. Deploy the Cloudflare Worker proxy and update AI_PROXY_URL in the app.");setAiLoading(false);return;}
+      const res=await fetch(AI_PROXY_URL,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-6",max_tokens:1000,messages:[{role:"user",content:prompt}]})});
         const data=await res.json();
         setAiPlan(data.content?.map(b=>b.text||"").join("")||"Unable to generate plan.");
       }catch{setAiPlan("Could not load plan. Check connection.");}
@@ -1125,7 +1133,269 @@ Write a SHORT personalized budget + savings plan (5-7 sentences). Cover: which b
     );
   }
 
-  const TABS=[{id:"dashboard",label:"Overview",emoji:"◈"},{id:"expenses",label:"Expenses",emoji:"↓"},{id:"income",label:"Income",emoji:"↑"},{id:"balance",label:"Balance",emoji:"◉"},{id:"calendar",label:"Calendar",emoji:"▦"},{id:"insights",label:"Insights",emoji:"✦"},{id:"planner",label:"Planner",emoji:"💜"}];
+
+  // ── DATA (IMPORT / EXPORT / STORAGE) ──
+  function DataPage(){
+    const [importText,setImportText]=useState("");
+    const [importError,setImportError]=useState("");
+    const [importSuccess,setImportSuccess]=useState("");
+    const [showConfirmClear,setShowConfirmClear]=useState(false);
+    const [showImportBox,setShowImportBox]=useState(false);
+
+    // Storage info
+    function getStorageInfo(){
+      try{
+        const raw=localStorage.getItem(LS_KEY)||"{}";
+        const bytes=new Blob([raw]).size;
+        const kb=(bytes/1024).toFixed(2);
+        const planRaw=localStorage.getItem(LS_KEY+"_plan")||"{}";
+        const planBytes=new Blob([planRaw]).size;
+        const planKb=(planBytes/1024).toFixed(2);
+        const totalKb=(parseFloat(kb)+parseFloat(planKb)).toFixed(2);
+        const pct=((parseFloat(totalKb)/5120)*100).toFixed(1);
+        return{txnKb:kb,planKb,totalKb,pct,txnCount:allTxns.length};
+      }catch{return{txnKb:"?",planKb:"?",totalKb:"?",pct:"?",txnCount:0};}
+    }
+    const si=getStorageInfo();
+
+    // Export to JSON
+    function exportJSON(){
+      const data={
+        exportedAt:new Date().toISOString(),
+        version:"moneytracker-v2",
+        transactions:allTxns,
+        plan:JSON.parse(localStorage.getItem(LS_KEY+"_plan")||"{}"),
+        settings:{dark:isDark,year:yr,month:mo}
+      };
+      const blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json"});
+      const url=URL.createObjectURL(blob);
+      const a=document.createElement("a");
+      a.href=url;
+      a.download=`moneytracker-backup-${new Date().toISOString().slice(0,10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    // Export to CSV
+    function exportCSV(){
+      const headers=["Date","Description","Category","Type","Amount (PHP)"];
+      const rows=allTxns.map(t=>[
+        t.date,
+        `"${t.label.replace(/"/g,'""')}"`,
+        t.category,
+        t.income?"Income":"Expense",
+        t.income?t.amount:Math.abs(t.amount)
+      ]);
+      const csv=[headers.join(","),...rows.map(r=>r.join(","))].join("\n");
+      const blob=new Blob([csv],{type:"text/csv"});
+      const url=URL.createObjectURL(blob);
+      const a=document.createElement("a");
+      a.href=url;
+      a.download=`moneytracker-transactions-${new Date().toISOString().slice(0,10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    // Import from JSON
+    function doImport(){
+      setImportError("");setImportSuccess("");
+      try{
+        const parsed=JSON.parse(importText);
+        if(!parsed.transactions||!Array.isArray(parsed.transactions)) throw new Error("Invalid format: missing transactions array.");
+        const txns=parsed.transactions.map(t=>({
+          id:t.id||Date.now()+Math.random(),
+          date:t.date,label:t.label,
+          amount:typeof t.amount==="number"?t.amount:parseFloat(t.amount),
+          category:t.category||"Others",
+          income:!!t.income,
+          icon:t.icon||(t.income?"💰":"💸")
+        }));
+        // Merge — avoid duplicate IDs
+        setAllTxns(prev=>{
+          const existingIds=new Set(prev.map(t=>t.id));
+          const newTxns=txns.filter(t=>!existingIds.has(t.id));
+          return[...prev,...newTxns];
+        });
+        if(parsed.plan){try{localStorage.setItem(LS_KEY+"_plan",JSON.stringify(parsed.plan));}catch{}}
+        setImportSuccess(`✅ Imported ${txns.length} transactions successfully!`);
+        setImportText("");
+        setShowImportBox(false);
+      }catch(e){
+        setImportError("❌ "+e.message);
+      }
+    }
+
+    function clearAllData(){
+      setAllTxns([]);
+      try{localStorage.removeItem(LS_KEY);localStorage.removeItem(LS_KEY+"_plan");}catch{}
+      setShowConfirmClear(false);
+    }
+
+    const barW=Math.min(100,parseFloat(si.pct)||0);
+    const barColor=barW>80?C.red:barW>50?C.gold:C.green;
+
+    return(
+      <Scroll>
+        {/* Header */}
+        <div style={{background:"linear-gradient(145deg,#0e1a2e 0%,#0e1a18 100%)",border:"1px solid rgba(255,255,255,0.12)",borderRadius:28,padding:"24px 20px 20px",position:"relative",overflow:"hidden"}}>
+          <div style={{position:"absolute",top:-30,right:-30,width:120,height:120,borderRadius:"50%",background:"rgba(10,132,255,0.18)",filter:"blur(40px)",pointerEvents:"none"}}/>
+          <div style={{fontSize:11,color:"rgba(235,235,245,0.35)",letterSpacing:"1.5px",textTransform:"uppercase",marginBottom:6}}>Data Management</div>
+          <div style={{fontSize:26,fontWeight:700,color:C.text,letterSpacing:"-0.5px",marginBottom:4}}>Import & Export ⬡</div>
+          <div style={{fontSize:13,color:"rgba(235,235,245,0.5)",lineHeight:1.5}}>Back up your data, transfer to another device, or import from a backup file.</div>
+        </div>
+
+        {/* Storage Info */}
+        <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:20,padding:"16px"}}>
+          <div style={{fontSize:13,fontWeight:700,color:C.text,marginBottom:14,display:"flex",alignItems:"center",gap:7}}>
+            <span style={{fontSize:18}}>💾</span> Local Storage Usage
+          </div>
+          <div style={{height:8,background:C.trackBg,borderRadius:6,overflow:"hidden",marginBottom:10}}>
+            <div style={{height:"100%",width:`${barW}%`,background:`linear-gradient(90deg,${barColor}88,${barColor})`,borderRadius:6,transition:"width 0.6s ease"}}/>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:10}}>
+            {[
+              ["Transactions",si.txnKb+" KB","#5AC8F5"],
+              ["Planner",si.planKb+" KB","#BF5AF2"],
+              ["Total",si.totalKb+" KB",barColor]
+            ].map(([lbl,val,col])=>(
+              <div key={lbl} style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"10px 8px",textAlign:"center"}}>
+                <div style={{fontSize:13,fontWeight:700,color:col,letterSpacing:"-0.3px"}}>{val}</div>
+                <div style={{fontSize:9,color:C.textTert,marginTop:2,textTransform:"uppercase",letterSpacing:"0.5px"}}>{lbl}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+            {[
+              ["Total Records",si.txnCount+" txns","#FFD60A"],
+              ["Storage Limit","~5 MB","rgba(235,235,245,0.3)"]
+            ].map(([lbl,val,col])=>(
+              <div key={lbl} style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"10px 8px",textAlign:"center"}}>
+                <div style={{fontSize:14,fontWeight:700,color:col}}>{val}</div>
+                <div style={{fontSize:9,color:C.textTert,marginTop:2,textTransform:"uppercase",letterSpacing:"0.5px"}}>{lbl}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{marginTop:12,fontSize:11,color:C.textTert,lineHeight:1.6,padding:"8px 10px",background:C.card,borderRadius:10,border:`1px solid ${C.border}`}}>
+            ℹ️ Data is stored locally on your device using localStorage. It is <strong style={{color:C.text}}>not synced to the cloud</strong>. Export regularly to avoid data loss.
+          </div>
+        </div>
+
+        {/* Export */}
+        <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:20,padding:"16px"}}>
+          <div style={{fontSize:13,fontWeight:700,color:C.text,marginBottom:4,display:"flex",alignItems:"center",gap:7}}>
+            <span style={{fontSize:18}}>📤</span> Export Data
+          </div>
+          <div style={{fontSize:12,color:C.textTert,marginBottom:14,lineHeight:1.5}}>Download all your transactions and settings as a backup file. Use JSON to restore later, or CSV to open in Excel / Google Sheets.</div>
+          <div style={{display:"flex",flexDirection:"column",gap:10}}>
+            <button onClick={exportJSON} style={{width:"100%",padding:"14px",background:`linear-gradient(135deg,${C.blueSoft},rgba(10,132,255,0.12))`,border:`1px solid ${C.blue}44`,borderRadius:14,color:C.blue,fontWeight:700,fontSize:14,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
+              <span style={{fontSize:18}}>📦</span> Export as JSON (Full Backup)
+            </button>
+            <button onClick={exportCSV} style={{width:"100%",padding:"14px",background:`linear-gradient(135deg,${C.greenSoft},rgba(48,209,88,0.08))`,border:`1px solid ${C.green}44`,borderRadius:14,color:C.green,fontWeight:700,fontSize:14,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
+              <span style={{fontSize:18}}>📊</span> Export as CSV (Excel / Sheets)
+            </button>
+          </div>
+          <div style={{marginTop:10,fontSize:11,color:C.textTert,textAlign:"center"}}>
+            {allTxns.length} transaction{allTxns.length!==1?"s":""} will be exported
+          </div>
+        </div>
+
+        {/* Import */}
+        <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:20,padding:"16px"}}>
+          <div style={{fontSize:13,fontWeight:700,color:C.text,marginBottom:4,display:"flex",alignItems:"center",gap:7}}>
+            <span style={{fontSize:18}}>📥</span> Import Data
+          </div>
+          <div style={{fontSize:12,color:C.textTert,marginBottom:14,lineHeight:1.5}}>Restore from a previously exported JSON backup. Duplicate transactions (same ID) will be skipped automatically.</div>
+          {importSuccess&&<div style={{marginBottom:12,padding:"10px 14px",background:C.greenSoft,border:`1px solid ${C.green}33`,borderRadius:12,fontSize:13,color:C.green,fontWeight:500}}>{importSuccess}</div>}
+          {importError&&<div style={{marginBottom:12,padding:"10px 14px",background:C.redSoft,border:`1px solid ${C.red}33`,borderRadius:12,fontSize:13,color:C.red,fontWeight:500}}>{importError}</div>}
+          {!showImportBox?(
+            <button onClick={()=>setShowImportBox(true)} style={{width:"100%",padding:"14px",background:`linear-gradient(135deg,rgba(255,214,10,0.08),rgba(255,214,10,0.04))`,border:`1px dashed ${C.gold}55`,borderRadius:14,color:C.gold,fontWeight:600,fontSize:14,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
+              <span style={{fontSize:18}}>📂</span> Paste JSON to Import
+            </button>
+          ):(
+            <>
+              <textarea
+                value={importText}
+                onChange={e=>setImportText(e.target.value)}
+                placeholder={"Paste your exported JSON backup here...\n\nExample:\n{\n  \"version\": \"moneytracker-v2\",\n  \"transactions\": [...]\n}"}
+                rows={8}
+                style={{width:"100%",background:C.bg||"#060608",border:`1px solid ${importError?C.red:C.border}`,borderRadius:14,padding:"12px 14px",color:C.text,fontSize:12,fontFamily:"monospace",resize:"vertical",outline:"none",marginBottom:10,lineHeight:1.6}}
+              />
+              <div style={{display:"flex",gap:8}}>
+                <button onClick={()=>{setShowImportBox(false);setImportText("");setImportError("");}} style={{flex:1,padding:"12px",background:C.card,border:`1px solid ${C.border}`,borderRadius:12,color:C.textSec,fontWeight:600,fontSize:14,cursor:"pointer"}}>Cancel</button>
+                <button onClick={doImport} disabled={!importText.trim()} style={{flex:2,padding:"12px",background:importText.trim()?C.gold:"rgba(255,214,10,0.2)",border:"none",borderRadius:12,color:importText.trim()?"#060608":C.textTert,fontWeight:700,fontSize:14,cursor:importText.trim()?"pointer":"default"}}>Import & Merge</button>
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* AI Status */}
+        <div style={{background:C.card,border:`1px solid ${AI_READY?C.green+"44":C.gold+"44"}`,borderRadius:20,padding:"16px"}}>
+          <div style={{fontSize:13,fontWeight:700,color:C.text,marginBottom:4,display:"flex",alignItems:"center",gap:7}}>
+            <span style={{fontSize:18}}>{AI_READY?"🟢":"🟡"}</span> AI Features Status
+          </div>
+          <div style={{fontSize:12,color:C.textTert,marginBottom:12,lineHeight:1.5}}>
+            {AI_READY
+              ?"AI spending insights and budget planner are active and working."
+              :"AI features need a Cloudflare Worker proxy to work outside Claude.ai. See setup instructions below."}
+          </div>
+          {!AI_READY&&(
+            <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"12px 14px"}}>
+              <div style={{fontSize:12,fontWeight:700,color:C.gold,marginBottom:8}}>📋 Setup Steps</div>
+              {[
+                "Go to workers.cloudflare.com — sign up free",
+                "Create a new Worker, paste the worker.js file",
+                "Go to Settings → Variables → add secret: ANTHROPIC_API_KEY",
+                "Deploy the worker, copy your worker URL",
+                'Open index.html, find AI_PROXY_URL and replace "YOUR_CLOUDFLARE_WORKER_URL_HERE" with your URL',
+                "Re-upload index.html to GitHub"
+              ].map((step,i)=>(
+                <div key={i} style={{display:"flex",gap:10,marginBottom:8,alignItems:"flex-start"}}>
+                  <div style={{width:20,height:20,borderRadius:"50%",background:C.gold+"22",border:`1px solid ${C.gold}44`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,fontWeight:700,color:C.gold,flexShrink:0,marginTop:1}}>{i+1}</div>
+                  <div style={{fontSize:12,color:C.textSec,lineHeight:1.5}}>{step}</div>
+                </div>
+              ))}
+            </div>
+          )}
+          {AI_READY&&(
+            <div style={{padding:"8px 12px",background:C.greenSoft,border:`1px solid ${C.green}33`,borderRadius:10,fontSize:12,color:C.green,fontWeight:500}}>
+              ✅ Connected to: <span style={{fontFamily:"monospace",fontSize:11}}>{AI_PROXY_URL}</span>
+            </div>
+          )}
+        </div>
+
+        {/* Danger Zone */}
+        <div style={{background:C.redSoft,border:`1px solid ${C.red}33`,borderRadius:20,padding:"16px"}}>
+          <div style={{fontSize:13,fontWeight:700,color:C.red,marginBottom:4,display:"flex",alignItems:"center",gap:7}}>
+            <span style={{fontSize:18}}>⚠️</span> Danger Zone
+          </div>
+          <div style={{fontSize:12,color:C.textTert,marginBottom:14,lineHeight:1.5}}>This will permanently delete all your transactions and settings. This action cannot be undone. Make sure to export first!</div>
+          <button onClick={()=>setShowConfirmClear(true)} style={{width:"100%",padding:"13px",background:"none",border:`1px solid ${C.red}55`,borderRadius:14,color:C.red,fontWeight:700,fontSize:14,cursor:"pointer"}}>
+            🗑️ Clear All Data
+          </button>
+        </div>
+
+        {/* Confirm clear modal */}
+        {showConfirmClear&&(
+          <div onClick={()=>setShowConfirmClear(false)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",backdropFilter:"blur(8px)",zIndex:300,display:"flex",alignItems:"flex-end",justifyContent:"center"}}>
+            <div onClick={e=>e.stopPropagation()} style={{background:C.modalBg,border:`1px solid ${C.borderMid}`,borderTop:`2px solid ${C.red}`,borderRadius:"28px 28px 0 0",padding:"24px 20px 40px",width:"100%",maxWidth:430,animation:"slideUp 0.2s ease"}}>
+              <div style={{width:52,height:52,borderRadius:16,background:C.redSoft,border:`1px solid ${C.red}33`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:24,margin:"0 auto 16px"}}>⚠️</div>
+              <div style={{textAlign:"center",marginBottom:6}}>
+                <div style={{fontSize:17,fontWeight:700,color:C.text,letterSpacing:"-0.3px"}}>Clear all data?</div>
+                <div style={{fontSize:13,color:C.textTert,marginTop:8,lineHeight:1.6}}>This will permanently delete <span style={{color:C.red,fontWeight:600}}>{allTxns.length} transactions</span> and all planner data. This cannot be undone.</div>
+              </div>
+              <div style={{height:1,background:C.border,margin:"18px 0"}}/>
+              <div style={{display:"flex",gap:10}}>
+                <button onClick={()=>setShowConfirmClear(false)} style={{flex:1,padding:"13px",background:C.card,border:`1px solid ${C.border}`,borderRadius:14,color:C.textSec,fontWeight:600,fontSize:15,cursor:"pointer"}}>Cancel</button>
+                <button onClick={clearAllData} style={{flex:1,padding:"13px",background:C.red,border:"none",borderRadius:14,color:"#fff",fontWeight:700,fontSize:15,cursor:"pointer"}}>Yes, Delete All</button>
+              </div>
+            </div>
+          </div>
+        )}
+      </Scroll>
+    );
+  }
+
+  const TABS=[{id:"dashboard",label:"Overview",emoji:"◈"},{id:"expenses",label:"Expenses",emoji:"↓"},{id:"income",label:"Income",emoji:"↑"},{id:"balance",label:"Balance",emoji:"◉"},{id:"calendar",label:"Calendar",emoji:"▦"},{id:"insights",label:"Insights",emoji:"✦"},{id:"planner",label:"Planner",emoji:"💜"},{id:"data",label:"Data",emoji:"⬡"}];
 
   return(
     <div style={{background:C.bg,minHeight:"100vh",maxWidth:430,margin:"0 auto",fontFamily:"-apple-system,'SF Pro Display','Inter',sans-serif",color:C.text,display:"flex",flexDirection:"column",position:"relative"}}>
@@ -1152,6 +1422,7 @@ Write a SHORT personalized budget + savings plan (5-7 sentences). Cover: which b
         {tab==="calendar"&&<CalendarPage/>}
         {tab==="insights"&&<InsightsPage/>}
         {tab==="planner"&&<PlannerPage/>}
+        {tab==="data"&&<DataPage/>}
       </div>
 
       <button onClick={()=>{setEditId(null);setForm({label:"",amount:"",category:"Food",date:new Date().toISOString().slice(0,10)});setShowAdd(true);}} style={{position:"fixed",bottom:74,left:"50%",transform:"translateX(-50%)",width:56,height:56,borderRadius:"50%",background:C.gold,border:`3px solid ${C.bg}`,color:"#060608",fontSize:26,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",boxShadow:`0 4px 18px ${C.goldGlow}`,cursor:"pointer",zIndex:110}}>+</button>
